@@ -6,90 +6,145 @@ import org.apache.karaf.minho.boot.service.ServiceRegistry;
 import org.apache.karaf.minho.boot.spi.Service;
 import org.eclipse.osc.orchestrator.OrchestratorPlugin;
 import org.eclipse.osc.modules.ocl.loader.Ocl;
+import org.openstack4j.api.Builders;
+import org.openstack4j.api.OSClient;
+import org.openstack4j.model.common.ActionResponse;
+import org.openstack4j.model.common.Identifier;
+import org.openstack4j.model.common.Payload;
+import org.openstack4j.model.common.Payloads;
+import org.openstack4j.model.image.v2.ContainerFormat;
+import org.openstack4j.model.image.v2.DiskFormat;
+import org.openstack4j.model.image.v2.Image;
+import org.openstack4j.model.magnum.Container;
+import org.openstack4j.model.magnum.ContainerBuilder;
+import org.openstack4j.model.network.IPVersionType;
+import org.openstack4j.openstack.OSFactory;
+import org.openstack4j.openstack.magnum.MagnumContainer;
 
 import java.io.BufferedWriter;
 import java.io.OutputStreamWriter;
 import java.net.HttpURLConnection;
 import java.net.URL;
+import java.util.UUID;
 
 @Slf4j
 public class OpenstackOrchestratorPlugin implements OrchestratorPlugin, Service {
 
-    private String authenticationUrl;
-    private String authenticationUsername;
-    private String authenticationPassword;
-    private String authenticationDomain;
-    private String authenticationProject;
+    private OSClient.OSClientV3 osClient;
 
     @Override
     public String name() {
-        return "osc-orchestrator-openstack";
+        return "osc-openstack-plugin";
     }
 
     @Override
     public void onRegister(ServiceRegistry serviceRegistry) {
         ConfigService configService = serviceRegistry.get(ConfigService.class);
-        if (configService == null) {
-            throw new IllegalStateException("Config service is not present in the registry");
-        }
-        // typically authentication.url should look like https://foo/v3/auth/tokens
-        if (configService.getProperty("authentication.url") == null) {
-            throw new IllegalStateException("authentication.url is not present in config service");
-        }
-        authenticationUrl = configService.getProperty("authentication.url");
-        if (configService.getProperty("authentication.username") == null) {
-            throw new IllegalStateException("authentication.username is not present in config service");
-        }
-        authenticationUsername = configService.getProperty("authentication.username");
-        if (configService.getProperty("authentication.password") == null) {
-            throw new IllegalStateException("authentication.password is not present in config service");
-        }
-        authenticationPassword = configService.getProperty("authentication.password");
-        if (configService.getProperty("authentication.domain") == null) {
-            throw new IllegalStateException("authentication.domain is not present in config service");
-        }
-        authenticationDomain = configService.getProperty("authentication.domain");
-        if (configService.getProperty("authentication.project") == null) {
-            throw new IllegalStateException("authentication.project is not present in config service");
-        }
-        authenticationProject = configService.getProperty("authentication.project");
-    }
 
-    /**
-     * Authenticate on the openstack URL and get the token
-     *
-     * @return the token
-     * @throws Exception if the authentcation fails
-     */
-    private String authenticate() throws Exception {
-        log.info("Authenticate on " + authenticationUrl);
-        // TODO support proxy
-        HttpURLConnection connection = (HttpURLConnection) new URL(authenticationUrl).openConnection();
-        connection.setRequestMethod("POST");
-        connection.setRequestProperty("Content-Type", "application/json");
-        connection.setRequestProperty("Accept", "application/json");
-        connection.setDoInput(true);
-        connection.setDoOutput(true);
-        String authJson = "{ \"auth\": { \"identity\": { \"methods\": [\"password\"], \"password\": { \"user\": { \"name\": \""
-                + authenticationUsername + "\", \"domain\": { \"name\": \""
-                + authenticationDomain + "\" }, \"password\": \""
-                + authenticationPassword + "\" }}}, \"scope\": { \"project\": { \"id\": \""
-                + authenticationProject + "\" }}}}";
-        log.debug("Authentication JSON request:");
-        log.debug(authJson);
-        try (BufferedWriter writer = new BufferedWriter(new OutputStreamWriter(connection.getOutputStream()))) {
-            writer.write(authJson);
-            writer.flush();
+        if (configService == null) {
+            throw new IllegalStateException("Config service is not available");
         }
-        if (connection.getResponseCode() != 201) {
-            throw new IllegalStateException("Can't get token (" + connection.getResponseCode() + "): " + connection.getResponseMessage());
+
+        String endpoint = configService.getProperty("openstack.endpoint", "http://127.0.0.1:5000/v3");
+        String domainId = null;
+        if (configService.getProperty("openstack.domainId") != null) {
+            domainId = configService.getProperty("openstack.domainId");
         }
-        return connection.getHeaderField("X-Subject-Token");
+        String domainName = null;
+        if (configService.getProperty("openstack.domainName") != null) {
+            domainName = configService.getProperty("openstack.domainName");
+        }
+        String projectId = null;
+        if (configService.getProperty("openstack.projectId") != null) {
+            projectId = configService.getProperty("openstack.projectId");
+        }
+        String projectName = null;
+        if (configService.getProperty("openstack.projectName") != null) {
+            projectName = configService.getProperty("openstack.projectName");
+        }
+        String username = configService.getProperty("openstack.username", "admin");
+        String secret = configService.getProperty("openstack.secret", "secret");
+
+        Identifier domainIdentifier = null;
+        if (domainId != null) {
+            domainIdentifier = Identifier.byId(domainId);
+        }
+        if (domainName != null) {
+            domainIdentifier = Identifier.byName(domainName);
+        }
+
+        Identifier projectIdentifier = null;
+        if (projectId != null) {
+            projectIdentifier = Identifier.byId(projectId);
+        }
+        if (projectName != null) {
+            projectIdentifier = Identifier.byName(projectName);
+        }
+
+        if (domainIdentifier != null && projectIdentifier != null) {
+            osClient = OSFactory.builderV3()
+                    .endpoint(endpoint)
+                    .credentials(username, secret)
+                    .scopeToProject(projectIdentifier, domainIdentifier)
+                    .authenticate();
+        }
+        if (domainIdentifier == null && projectIdentifier != null) {
+            osClient = OSFactory.builderV3()
+                    .endpoint(endpoint)
+                    .credentials(username, secret)
+                    .scopeToProject(projectIdentifier)
+                    .authenticate();
+        }
+        if (domainIdentifier != null && projectIdentifier == null) {
+            osClient = OSFactory.builderV3()
+                    .endpoint(endpoint)
+                    .credentials(username, secret)
+                    .scopeToDomain(domainIdentifier)
+                    .authenticate();
+        }
     }
 
     @Override
     public void registerManagedService(Ocl ocl) {
-        log.info("Register managed service, creating openstack resource");
+        log.info("Register managed service, creating openstack resources");
+
+        log.info("Creating Neutron network resources ...");
+        ocl.getNetwork().getSubnet().forEach(subnet -> {
+            osClient.networking().subnet().create(Builders.subnet()
+                    .name(subnet.getId())
+                    .ipVersion(IPVersionType.V4)
+                    .cidr(subnet.getCidr())
+                    .build());
+        });
+        ocl.getImage().getArtifacts().forEach(artifact -> {
+            if (artifact.getType().equalsIgnoreCase("docker")) {
+                log.info("Starting docker container via Magnum ...");
+                ContainerBuilder builder = new MagnumContainer.ContainerConcreteBuilder();
+                builder.image(artifact.getBase());
+                builder.name(artifact.getName());
+                Container container = osClient.magnum().createContainer(builder.build());
+                osClient.magnum().startContainer(artifact.getName());
+                log.info("Docker container " + container.getStatus());
+            }
+            if (artifact.getType().equalsIgnoreCase("image")) {
+                log.info("Starting bare image via Glance ...");
+                Image image = osClient.imagesV2().create(Builders.imageV2()
+                        .name(artifact.getName())
+                        .containerFormat(ContainerFormat.BARE)
+                        .visibility(Image.ImageVisibility.PUBLIC)
+                        .diskFormat(DiskFormat.QCOW2)
+                        .minDisk(0L)
+                        .minRam(0L)
+                        .build());
+                try {
+                    Payload<URL> payload = Payloads.create(new URL(artifact.getBase()));
+                    ActionResponse upload = osClient.imagesV2().upload(image.getId(), payload, image);
+                    log.info("Bare image " + upload.getCode());
+                } catch (Exception e) {
+                    log.warn("Can't create bare image {}", artifact.getName(), e);
+                }
+            }
+        });
     }
 
     @Override
